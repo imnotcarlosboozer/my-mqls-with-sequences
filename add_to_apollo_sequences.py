@@ -76,25 +76,22 @@ def create_contact(first_name: str, last_name: str, email: str, person_data: dic
         return None
 
 
-def get_sequence_id(sequence_name: str, sequences_cache: Dict[str, str]) -> Optional[str]:
-    """Get sequence ID by name, using cache to avoid repeated API calls."""
-    if sequence_name in sequences_cache:
-        return sequences_cache[sequence_name]
+def get_all_sequences_once(sequences_cache: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fetch all sequences once and store in cache."""
+    if 'all_sequences' in sequences_cache:
+        return sequences_cache['all_sequences']
 
     url = f'{APOLLO_API_URL}/emailer_campaigns/search'
-
     headers = {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache'
     }
 
-    try:
-        # Search through multiple pages to find exact match
-        # Apollo's search doesn't do exact matching, so we need to search all results
-        page = 1
-        max_pages = 10  # Limit search to prevent infinite loops
+    all_sequences = []
+    page = 1
 
-        while page <= max_pages:
+    try:
+        while True:
             payload = {
                 'api_key': APOLLO_API_KEY,
                 'page': page,
@@ -106,25 +103,83 @@ def get_sequence_id(sequence_name: str, sequences_cache: Dict[str, str]) -> Opti
             data = response.json()
 
             campaigns = data.get('emailer_campaigns', [])
+            if not campaigns:
+                break
 
-            # Look for exact match
-            for campaign in campaigns:
-                if campaign.get('name') == sequence_name:
-                    sequence_id = campaign['id']
-                    sequences_cache[sequence_name] = sequence_id
-                    return sequence_id
+            all_sequences.extend(campaigns)
 
-            # If we got fewer than 100 results, we've reached the end
             if len(campaigns) < 100:
                 break
 
             page += 1
 
-        print(f"Warning: Sequence '{sequence_name}' not found")
-        return None
+        sequences_cache['all_sequences'] = all_sequences
+        return all_sequences
+
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching sequence '{sequence_name}': {e}")
-        return None
+        print(f"Error fetching sequences: {e}")
+        return []
+
+
+def get_sequence_id(sequence_name: str, sequences_cache: Dict[str, Any], last_activity: str = '') -> Optional[str]:
+    """Get sequence ID by name, with smart handling of ATTENDED/NO SHOW variants."""
+    # Check simple cache first
+    cache_key = f"{sequence_name}|{last_activity}"
+    if cache_key in sequences_cache:
+        return sequences_cache[cache_key]
+
+    # Get all sequences
+    all_sequences = get_all_sequences_once(sequences_cache)
+
+    # Try exact match first
+    for campaign in all_sequences:
+        if campaign.get('name') == sequence_name:
+            sequence_id = campaign['id']
+            sequences_cache[cache_key] = sequence_id
+            return sequence_id
+
+    # If no exact match, check if this is a webinar sequence that needs ATTENDED/NO SHOW suffix
+    if 'Webinar' in sequence_name or 'webinar' in sequence_name:
+        # Check if ATTENDED or NO SHOW variants exist
+        attended_name = f"{sequence_name} ATTENDED"
+        no_show_name = f"{sequence_name} NO SHOW"
+
+        attended_seq = None
+        no_show_seq = None
+
+        for campaign in all_sequences:
+            camp_name = campaign.get('name', '')
+            if camp_name == attended_name:
+                attended_seq = campaign
+            elif camp_name == no_show_name:
+                no_show_seq = campaign
+
+        # If both variants exist, choose based on last_activity
+        if attended_seq and no_show_seq:
+            if last_activity and last_activity.strip():
+                # Has activity - assume attended
+                print(f"  → Found activity date ({last_activity}), using ATTENDED sequence")
+                sequences_cache[cache_key] = attended_seq['id']
+                return attended_seq['id']
+            else:
+                # No activity - assume no show
+                print(f"  → No activity date, using NO SHOW sequence")
+                sequences_cache[cache_key] = no_show_seq['id']
+                return no_show_seq['id']
+
+        # If only one variant exists, use it
+        if attended_seq:
+            print(f"  → Using ATTENDED sequence variant")
+            sequences_cache[cache_key] = attended_seq['id']
+            return attended_seq['id']
+
+        if no_show_seq:
+            print(f"  → Using NO SHOW sequence variant")
+            sequences_cache[cache_key] = no_show_seq['id']
+            return no_show_seq['id']
+
+    print(f"Warning: Sequence '{sequence_name}' not found")
+    return None
 
 
 def add_contact_to_sequence(contact_id: str, sequence_id: str, first_name: str, last_name: str) -> Dict[str, Any]:
@@ -191,6 +246,7 @@ def process_csv(csv_file_path: str):
         'not_found': 0,
         'no_sequence': 0,
         'skipped_in_other_sequence': 0,
+        'skipped_job_change': 0,
         'errors': 0
     }
     skipped_contacts = []  # Track contacts that need manual intervention
@@ -203,6 +259,7 @@ def process_csv(csv_file_path: str):
             last_name = row.get('Last Name', '').strip()
             email = row.get('Email', '').strip()
             sequence_name = row.get('Recommended Outreach Sequence', '').strip()
+            last_activity = row.get('Last Activity', '').strip()
 
             stats['total'] += 1
 
@@ -218,6 +275,8 @@ def process_csv(csv_file_path: str):
 
             print(f"\nProcessing: {first_name} {last_name} ({email})")
             print(f"Sequence: {sequence_name}")
+            if last_activity:
+                print(f"Last Activity: {last_activity}")
 
             # Search for contact in Apollo
             contact_id = search_contact(first_name, last_name, email)
@@ -229,8 +288,8 @@ def process_csv(csv_file_path: str):
 
             print(f"Found contact ID: {contact_id}")
 
-            # Get sequence ID
-            sequence_id = get_sequence_id(sequence_name, sequences_cache)
+            # Get sequence ID (automatically handles ATTENDED/NO SHOW variants)
+            sequence_id = get_sequence_id(sequence_name, sequences_cache, last_activity)
 
             if not sequence_id:
                 stats['errors'] += 1
@@ -247,6 +306,17 @@ def process_csv(csv_file_path: str):
                     print(f"⚠️  Skipped: Already in another active sequence")
                     print(f"   Action needed: Manually remove from current sequence in Apollo")
                     stats['skipped_in_other_sequence'] += 1
+                    skipped_contacts.append({
+                        'name': f"{first_name} {last_name}",
+                        'email': email,
+                        'target_sequence': sequence_name,
+                        'contact_id': contact_id,
+                        'reason': reason
+                    })
+                elif reason == 'contacts_with_job_change':
+                    print(f"⚠️  Skipped: Recent job change detected")
+                    print(f"   Action needed: Review in Apollo and manually add if appropriate")
+                    stats['skipped_job_change'] += 1
                     skipped_contacts.append({
                         'name': f"{first_name} {last_name}",
                         'email': email,
@@ -272,6 +342,7 @@ def process_csv(csv_file_path: str):
     print(f"Not found in Apollo: {stats['not_found']}")
     print(f"No recommended sequence: {stats['no_sequence']}")
     print(f"Already in other sequences (need manual removal): {stats['skipped_in_other_sequence']}")
+    print(f"Job change detected (need manual review): {stats['skipped_job_change']}")
     print(f"Errors: {stats['errors']}")
 
     # Print details of skipped contacts
@@ -279,17 +350,28 @@ def process_csv(csv_file_path: str):
         print("\n" + "="*50)
         print("CONTACTS NEEDING MANUAL INTERVENTION")
         print("="*50)
-        print("\nThese contacts are already in other active sequences.")
-        print("Action: Remove them from their current sequence in Apollo, then re-run this script.\n")
 
-        for contact in skipped_contacts:
-            print(f"• {contact['name']} ({contact['email']})")
-            print(f"  Target sequence: {contact['target_sequence']}")
-            print(f"  Reason: {contact['reason']}\n")
+        # Group by reason
+        in_other_sequences = [c for c in skipped_contacts if c['reason'] == 'contacts_active_in_other_campaigns']
+        job_changes = [c for c in skipped_contacts if c['reason'] == 'contacts_with_job_change']
+
+        if in_other_sequences:
+            print("\n1. Already in other active sequences:")
+            print("   Action: Remove from current sequence in Apollo, then re-run this script.\n")
+            for contact in in_other_sequences:
+                print(f"   • {contact['name']} ({contact['email']})")
+                print(f"     Target sequence: {contact['target_sequence']}\n")
+
+        if job_changes:
+            print("\n2. Recent job change detected:")
+            print("   Action: Review contact details in Apollo and manually add if appropriate.\n")
+            for contact in job_changes:
+                print(f"   • {contact['name']} ({contact['email']})")
+                print(f"     Target sequence: {contact['target_sequence']}\n")
 
 
 if __name__ == '__main__':
-    csv_file = '/Users/vishwasrinivasan/Downloads/report1771436312348.csv'
+    csv_file = '/Users/vishwasrinivasan/Downloads/report1771535690371.csv'
 
     print("Apollo Sequence Enrollment Script")
     print("="*50)
