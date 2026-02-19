@@ -1,0 +1,28 @@
+# Apollo API Credentials - DO NOT COMMIT
+apollo_config.py
+
+# CSV Reports with personal data
+*.csv
+report*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
