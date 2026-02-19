@@ -46,11 +46,6 @@ EMAIL_ACCOUNT_ID = "YOUR_EMAIL_ACCOUNT_ID_HERE"
 APOLLO_API_URL = "https://api.apollo.io/v1"
 ```
 
-**Example:**
-```python
-APOLLO_API_KEY = "RPSs02pLXPo7kpTey1iFTw"
-EMAIL_ACCOUNT_ID = "677eb30031d14101b078515e"
-APOLLO_API_URL = "https://api.apollo.io/v1"
 ```
 
 ### Step 3: Prepare Your CSV File
